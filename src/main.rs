@@ -1,17 +1,28 @@
 use clap::{Parser, Subcommand};
-use colored::Colorize;
 use copypasta::{ClipboardContext, ClipboardProvider};
-use crossterm::event::{read, Event, KeyCode};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use passwords::analyzer;
-use passwords::scorer;
-use passwords::PasswordGenerator;
+use rand::distributions::Uniform;
+use rand::{thread_rng, Rng};
 use std::io;
 use std::io::Write;
 use std::{
     fs::{self, OpenOptions},
+    iter,
     path::Path,
 };
+
+use crossterm::event::{read, Event, KeyCode};
+use crossterm::execute;
+use crossterm::style::{Attribute, Color, Print, ResetColor, SetAttribute, SetForegroundColor};
+
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use passwords::analyzer;
+use passwords::scorer;
+
+#[derive(PartialEq)]
+enum WeakPasswordChoice {
+    ABORT,
+    CONTINUE,
+}
 
 #[derive(Parser)]
 struct Cli {
@@ -43,62 +54,67 @@ fn main() -> std::io::Result<()> {
         Commands::Add {
             service,
             username,
-            generate,
             clipboard,
+            generate,
             write,
-        } => handle_new_password(service, username, generate, clipboard, write),
+        } => {
+            if generate {
+                let password = generate_password();
+                println!("{}", password);
+                let _ = add_new_password(&service, &username, &password);
+            }
+
+            if clipboard {
+                let password = get_clipboard_password();
+                println!("{}", password);
+                if should_save_password(&password) {
+                    let _ = add_new_password(&service, &username, &password);
+                }
+            }
+
+            if write {
+                let password = get_user_input().unwrap();
+                if should_save_password(&password) {
+                    let _ = add_new_password(&service, &username, &password);
+                }
+            }
+        }
     }
     Ok(())
 }
 
-fn handle_new_password(
-    service: String,
-    username: String,
-    generate: bool,
-    clipboard: bool,
-    write: bool,
-) {
-    if generate {
-        let password = generate_password();
-        let _ = add_new_password(&service, &username, &password);
-    }
-    if clipboard {
-        let mut ctx = ClipboardContext::new().unwrap();
-        println!("Let's get what you have in the clipboard");
-        let password_in_clipboard = ctx.get_contents().unwrap();
-        if should_save_password(&password_in_clipboard) {
-            let _ = add_new_password(&service, &username, &password_in_clipboard);
-        }
-    }
-    if write {
-        let password = handle_write_password().ok().unwrap();
-        if should_save_password(&password) {
-            let _ = add_new_password(&service, &username, &password);
-        }
+fn get_user_input() -> io::Result<String> {
+    println!("Write it down the press Enter!");
+    let mut input = String::new();
+    match io::stdin().read_line(&mut input) {
+        Ok(n) => return Ok(input.trim().to_string()),
+        Err(error) => Err(error),
     }
 }
 
+fn get_clipboard_password() -> String {
+    let mut ctx = ClipboardContext::new().unwrap();
+    return ctx.get_contents().unwrap();
+}
+
 fn generate_password() -> String {
-    PasswordGenerator::new()
-        .length(16)
-        .numbers(true)
-        .uppercase_letters(true)
-        .symbols(true)
-        .spaces(true)
-        .exclude_similar_characters(true)
-        .strict(true)
-        .generate_one()
-        .unwrap()
+    let charset: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ\
+                           abcdefghijklmnopqrstuvwxyz\
+                           0123456789\
+                           !@#$%^&*()_-+=[{]}\\;:'\",<.>/?";
+    let mut rng = thread_rng();
+    let password: String = iter::repeat_with(|| {
+        let idx = rng.sample(Uniform::from(0..charset.len()));
+        charset[idx] as char
+    })
+    .take(16)
+    .collect();
+    password
 }
 
 fn should_save_password(password: &str) -> bool {
     if is_password_weak(password) {
-        println!(
-            "{} {}",
-            password.red(),
-            "is a weak password. Press Enter to continue anyway. Press Q to abort and try again!"
-                .red()
-        );
+        print_alert(password);
         if let Ok(choice) = read_next_char() {
             return choice == WeakPasswordChoice::CONTINUE;
         } else {
@@ -109,44 +125,40 @@ fn should_save_password(password: &str) -> bool {
     }
 }
 
+fn print_alert(password: &str) {
+    let alert = format!(
+        "{} is a weak password. Press Enter to continue anyway. Press Q to abort and try again!",
+        password
+    );
+    execute!(
+        io::stdout(),
+        SetForegroundColor(Color::Red),
+        SetAttribute(Attribute::Bold),
+        Print(alert),
+        ResetColor,
+        SetAttribute(Attribute::Reset)
+    )
+    .unwrap();
+}
+
 fn is_password_weak(password: &str) -> bool {
     let score = scorer::score(&analyzer::analyze(password));
     return score < 80.0;
-}
-
-fn handle_write_password() -> io::Result<String> {
-    println!("Write it down!");
-    let mut input = String::new();
-    match io::stdin().read_line(&mut input) {
-        Ok(n) => return Ok(input),
-        Err(error) => Err(error),
-    }
-}
-
-#[derive(PartialEq)]
-enum WeakPasswordChoice {
-    ABORT,
-    CONTINUE,
 }
 
 fn read_next_char() -> io::Result<WeakPasswordChoice> {
     enable_raw_mode()?;
     let result = loop {
         match read()? {
-            Event::Key(event) => {
-                // Handle key press
-                match event.code {
-                    KeyCode::Char('q') | KeyCode::Char('Q') => {
-                        break Ok(WeakPasswordChoice::ABORT);
-                    }
-                    KeyCode::Enter => {
-                        break Ok(WeakPasswordChoice::CONTINUE);
-                    }
-                    _ => {
-                        println!("You pressed: {:?}", event.code);
-                    }
+            Event::Key(event) => match event.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    break Ok(WeakPasswordChoice::ABORT);
                 }
-            }
+                KeyCode::Enter => {
+                    break Ok(WeakPasswordChoice::CONTINUE);
+                }
+                _ => {}
+            },
             _ => {}
         }
     };
